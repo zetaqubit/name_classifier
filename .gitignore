@@ -1,0 +1,24 @@
+# bazel
+bazel-bin
+bazel-genfiles
+bazel-out
+bazel-testlogs
+bazel-blaze_root
+
+# vim
+*.swp
+
+# ycm
+.ycm_extra_conf.pyc
+
+# LMDB
+**/lock.mdb
+
+# Android Studio
+.idea/
+
+# Python
+*.pyc
+
+# IPython Notebook
+.ipynb_checkpoints/
