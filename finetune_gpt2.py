@@ -70,13 +70,16 @@ def main(argv):
 
   # For validation the order doesn't matter, so we'll just read them sequentially.
   validation_dataloader = DataLoader(
-              val_dataset, # The validation samples.
-              sampler = SequentialSampler(val_dataset), # Pull out batches sequentially.
-              batch_size = batch_size # Evaluate with this batch size.
-          )
+      val_dataset, # The validation samples.
+      sampler = SequentialSampler(val_dataset), # Pull out batches sequentially.
+      batch_size = batch_size # Evaluate with this batch size.
+  )
 
 
-  configuration = GPT2Config.from_pretrained('gpt2', output_hidden_states=False)
+  configuration = GPT2Config.from_pretrained(
+      'gpt2',
+      output_hidden_states=False,
+      pad_token_id=tokenizer.pad_token_id)
 
   # instantiate the model
   model = GPT2LMHeadModel.from_pretrained("gpt2", config=configuration)
