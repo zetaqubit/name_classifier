@@ -2,6 +2,7 @@
 """
 
 import datetime
+import itertools
 import time
 import os
 import random
@@ -15,6 +16,7 @@ from torch.utils.data import Dataset, DataLoader, random_split, RandomSampler, S
 
 from transformers import GPT2LMHeadModel,  GPT2Tokenizer, GPT2Config, GPT2LMHeadModel
 from transformers import AdamW, get_linear_schedule_with_warmup
+import wandb
 
 from model import data_loader
 
@@ -24,6 +26,11 @@ flags.DEFINE_string('exp_name', None,
   'Name of the experiment. Will be used to as a directory name relative to _MODEL_DIR.')
 flags.DEFINE_string('dataset_name', None,
   'Path to the dataset to train on. Relative to _DATASET_DIR.')
+flags.DEFINE_integer('num_workers', 12,
+  'Number of workers to parallelize data loading.')
+flags.DEFINE_integer('save_every_n_steps', 1000,
+  'Number of steps to take before saving the model.')
+
 
 # Parent directory for saving the trained models.
 _MODEL_DIR = '/media/14tb/ml/models/zetaqubit/name_classifier/gpt2'
@@ -32,21 +39,10 @@ _MODEL_DIR = '/media/14tb/ml/models/zetaqubit/name_classifier/gpt2'
 _DATASET_DIR = '/media/14tb/ml/data/fb_500m/cleaned'
 
 
-def main(argv):
-  print(f'Experiment name: {FLAGS.exp_name}')
-
-  exp_dir = os.path.join(_MODEL_DIR, FLAGS.exp_name)
-  if not os.path.exists(exp_dir):
-    os.makedirs(exp_dir)
-
-  tokenizer = GPT2Tokenizer.from_pretrained('gpt2', bos_token='<|startoftext|>',
-    eos_token='<|endoftext|>', pad_token='<|pad|>') #gpt2-medium
-
-  filepath = os.path.join(_DATASET_DIR, FLAGS.dataset_name)
+def create_dataloaders_singlefile(filepath, tokenizer, batch_size):
   with open(filepath) as file:
     lines = file.readlines()
     lines = [line.rstrip() for line in lines]
-
   dataset = data_loader.GPT2Dataset(lines, tokenizer, max_length=128)
 
   # Split into training and validation sets
@@ -57,8 +53,6 @@ def main(argv):
 
   print('{:>5,} training samples'.format(train_size))
   print('{:>5,} validation samples'.format(val_size))
-
-  batch_size = 16
 
   # Create the DataLoaders for our training and validation datasets.
   # We'll take training samples in random order. 
@@ -75,6 +69,48 @@ def main(argv):
       batch_size = batch_size # Evaluate with this batch size.
   )
 
+  return train_dataloader, validation_dataloader
+
+
+def create_dataloaders_singledir(dir, tokenizer, batch_size):
+  dataset = data_loader.FB500Dataset(dir)
+  dataset = data_loader.GPT2StreamingDataset(dataset, tokenizer, max_length=64)
+
+  train_dataset = dataset
+
+  train_dataloader = DataLoader(
+              train_dataset,  # The training samples.
+              batch_size = batch_size, # Trains with this batch size.
+              num_workers=FLAGS.num_workers,
+          )
+  return train_dataloader, train_dataloader
+
+
+def main(argv):
+  print(f'Experiment name: {FLAGS.exp_name}')
+
+
+  exp_dir = os.path.join(_MODEL_DIR, FLAGS.exp_name)
+  if not os.path.exists(exp_dir):
+    os.makedirs(exp_dir)
+
+  tokenizer = GPT2Tokenizer.from_pretrained('gpt2', bos_token='<|startoftext|>',
+    eos_token='<|endoftext|>', pad_token='<|pad|>') #gpt2-medium
+
+  batch_size = 16
+
+  train_dataloader, validation_dataloader = create_dataloaders_singlefile(
+    os.path.join(_DATASET_DIR, FLAGS.dataset_name),
+    tokenizer,
+    batch_size
+  )
+
+
+  # train_dataloader, validation_dataloader = create_dataloaders_singledir(
+  #   _DATASET_DIR,
+  #   tokenizer,
+  #   batch_size
+  # )
 
   configuration = GPT2Config.from_pretrained(
       'gpt2',
@@ -99,6 +135,15 @@ def main(argv):
   warmup_steps = 1e2
   epsilon = 1e-8
 
+  wandb.init(project=f'name_classifier-{FLAGS.exp_name}') 
+  wandb.config = {
+    "learning_rate": learning_rate,
+    "epochs": epochs,
+    "batch_size": batch_size
+  }
+
+  wandb.watch(model)
+
   # this produces sample output every 100 steps
   sample_every = 100
 
@@ -109,7 +154,11 @@ def main(argv):
                 )
   # Total number of training steps is [number of batches] x [number of epochs]. 
   # (Note that this is not the same as the number of training samples).
-  total_steps = len(train_dataloader) * epochs
+  #total_steps = len(train_dataloader) * epochs
+  train_total_batches = 100_000_000  # len(train_dataloader)
+  validation_total_batches = 10_000  # len(validation_dataloader)
+
+  total_steps = 1_000_000
 
   # Create the learning rate scheduler.
   # This changes the learning rate as the training loop progresses
@@ -139,7 +188,7 @@ def main(argv):
 
       model.train()
 
-      for step, batch in enumerate(train_dataloader):
+      for step, batch in enumerate(itertools.islice(train_dataloader, 0, train_total_batches)):
 
           b_input_ids = batch[0].to(device)
           b_labels = batch[0].to(device)
@@ -155,6 +204,9 @@ def main(argv):
 
           loss = outputs[0]  
 
+          wandb.log({"loss": loss})
+
+
           batch_loss = loss.item()
           total_train_loss += batch_loss
 
@@ -162,12 +214,12 @@ def main(argv):
           if step % sample_every == 0 and not step == 0:
 
               elapsed = format_time(time.time() - t0)
-              print('  Batch {:>5,}  of  {:>5,}. Loss: {:>5,}.   Elapsed: {:}.'.format(step, len(train_dataloader), batch_loss, elapsed))
+              print('  Batch {:>5,}  of  {:>5,}. Loss: {:>5,}.   Elapsed: {:}.'.format(step, train_total_batches, batch_loss, elapsed))
 
               model.eval()
 
               sample_outputs = model.generate(
-                                      bos_token_id=random.randint(1,30000),
+                                      #bos_token_id=random.randint(1,30000),
                                       do_sample=True,   
                                       top_k=50, 
                                       max_length = 200,
@@ -179,6 +231,11 @@ def main(argv):
               
               model.train()
 
+          
+          if step % FLAGS.save_every_n_steps == 0 and not step == 0:
+            print("Saving model to %s" % exp_dir)
+            save_model(tokenizer, model, exp_dir)
+
           loss.backward()
 
           optimizer.step()
@@ -186,7 +243,7 @@ def main(argv):
           scheduler.step()
 
       # Calculate the average loss over all of the batches.
-      avg_train_loss = total_train_loss / len(train_dataloader)       
+      avg_train_loss = total_train_loss / train_total_batches
       
       # Measure how long this epoch took.
       training_time = format_time(time.time() - t0)
@@ -210,7 +267,7 @@ def main(argv):
       nb_eval_steps = 0
 
       # Evaluate data for one epoch
-      for batch in validation_dataloader:
+      for batch in itertools.islice(validation_dataloader, 0, validation_total_batches):
           
           b_input_ids = batch[0].to(device)
           b_labels = batch[0].to(device)
@@ -228,7 +285,7 @@ def main(argv):
           batch_loss = loss.item()
           total_eval_loss += batch_loss        
 
-      avg_val_loss = total_eval_loss / len(validation_dataloader)
+      avg_val_loss = total_eval_loss / validation_total_batches
       
       validation_time = format_time(time.time() - t0)    
 
@@ -273,5 +330,5 @@ def save_model(tokenizer, model, output_dir):
 
 if __name__ == '__main__':
   flags.mark_flag_as_required('exp_name')
-  flags.mark_flag_as_required('dataset_name')
+  # flags.mark_flag_as_required('dataset_name')
   app.run(main)

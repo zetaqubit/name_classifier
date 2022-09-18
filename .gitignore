@@ -22,3 +22,6 @@ bazel-blaze_root
 
 # IPython Notebook
 .ipynb_checkpoints/
+
+# Weights and Biases.
+wandb/
